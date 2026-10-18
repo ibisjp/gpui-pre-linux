@@ -271,14 +271,15 @@ features = [
 ]
 optional = true
 
+# Modified by ibis inc. for ibisOffice (2026-10-18): xim 0.5.0 instead of zed-xim 0.4.0-zed, for xim-ctext 0.4
+# (0.3.0 repeated the start of a Japanese preedit or commit longer than its first buffer: こんに → こんにこんにｔ).
 [target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies.xim]
-version = "0.4.0-zed"
+version = "0.5.0"
 features = [
     "x11rb-xcb",
     "x11rb-client",
 ]
 optional = true
-package = "zed-xim"
 
 [target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies.xkbcommon]
 version = "0.8.0"

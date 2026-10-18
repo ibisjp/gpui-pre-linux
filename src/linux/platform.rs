@@ -33,7 +33,7 @@ use xkbcommon::xkb::{self, Keycode, Keysym, State};
 use crate::linux::{LinuxDispatcher, PriorityQueueCalloopReceiver};
 use gpui::{
     Action, ActivityGuard, AnyWindowHandle, BackgroundExecutor, ClipboardItem, CursorStyle,
-    DisplayId, ForegroundExecutor, Keymap, Menu, MenuItem, OwnedMenu, PathPromptOptions, Platform,
+    DisplayId, ForegroundExecutor, Keymap, Menu, MenuItem, OwnedMenu, PathPromptOptions, Platform, SaveFormat,
     PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem,
     PlatformWindow, Result, RunnableVariant, Task, ThermalState, WindowAppearance,
     WindowButtonLayout, WindowParams,
@@ -565,6 +565,116 @@ impl<P: LinuxClient + 'static> Platform for LinuxPlatform<P> {
                             .first()
                             .and_then(|uri: &ashpd::Uri| url::Url::parse(uri.as_str()).ok())
                             .and_then(|uri: url::Url| uri.to_file_path().ok())),
+                        Err(ashpd::Error::Response(_)) => Ok(None),
+                        Err(e) => Err(e.into()),
+                    };
+                    let _ = done_tx.send(result);
+                }
+            })
+            .detach();
+
+        done_rx
+    }
+
+    /// The save dialog with a choice of file formats (modified by ibis inc.: added). The portal's file chooser
+    /// has a combo box ("choice") beside the name, whose selected value comes back with the answer: the name
+    /// takes the format's extension (its first) when it has none that is one of the formats'. A portal that does
+    /// not show the choice leaves the typed name as it is.
+    fn prompt_for_new_path_with_formats(
+        &self,
+        directory: &Path,
+        suggested_name: Option<&str>,
+        formats: &[SaveFormat],
+    ) -> oneshot::Receiver<Result<Option<PathBuf>>> {
+        let formats: Vec<(String, Vec<String>)> = formats
+            .iter()
+            .filter(|f| !f.extensions.is_empty())
+            .map(|f| (f.label.to_string(), f.extensions.clone()))
+            .collect();
+        if formats.is_empty() {
+            return self.prompt_for_new_path(directory, suggested_name);
+        }
+        let (done_tx, done_rx) = oneshot::channel();
+
+        #[cfg(not(any(feature = "wayland", feature = "x11")))]
+        let _ = (done_tx.send(Ok(None)), directory, suggested_name, formats);
+
+        #[cfg(any(feature = "wayland", feature = "x11"))]
+        let identifier = self.inner.window_identifier();
+
+        #[cfg(any(feature = "wayland", feature = "x11"))]
+        self.foreground_executor()
+            .spawn({
+                let directory = directory.to_owned();
+                let suggested_name = suggested_name.map(|s| s.to_owned());
+
+                async move {
+                    // The format the suggested name's extension is of, else the first.
+                    let initial = suggested_name
+                        .as_deref()
+                        .and_then(|n| Path::new(n).extension())
+                        .and_then(|e| e.to_str())
+                        .and_then(|e| formats.iter().position(|f| f.1.iter().any(|x| x.eq_ignore_ascii_case(e))))
+                        .unwrap_or(0);
+                    let mut choice = ashpd::desktop::file_chooser::Choice::new("ibis-format", "Format", &initial.to_string());
+                    for (index, (label, _)) in formats.iter().enumerate() {
+                        choice = choice.insert(&index.to_string(), label);
+                    }
+                    let mut request_builder =
+                        ashpd::desktop::file_chooser::SaveFileRequest::default()
+                            .identifier(identifier.await)
+                            .modal(true)
+                            .title("Save File")
+                            .choice(choice)
+                            .current_folder(directory)
+                            .expect("pathbuf should not be nul terminated");
+
+                    if let Some(suggested_name) = suggested_name {
+                        request_builder = request_builder.current_name(suggested_name.as_str());
+                    }
+
+                    let request = match request_builder.send().await {
+                        Ok(request) => request,
+                        Err(err) => {
+                            let result = match err {
+                                ashpd::Error::PortalNotFound(_) => {
+                                    anyhow!(FILE_PICKER_PORTAL_MISSING)
+                                }
+                                err => err.into(),
+                            };
+                            let _ = done_tx.send(Err(result));
+                            return;
+                        }
+                    };
+
+                    let result = match request.response() {
+                        Ok(response) => {
+                            let chosen = response
+                                .choices()
+                                .iter()
+                                .find(|(key, _)| key == "ibis-format")
+                                .and_then(|(_, value)| value.parse::<usize>().ok())
+                                .and_then(|index| formats.get(index));
+                            Ok(response
+                                .uris()
+                                .first()
+                                .and_then(|uri: &ashpd::Uri| url::Url::parse(uri.as_str()).ok())
+                                .and_then(|uri: url::Url| uri.to_file_path().ok())
+                                .map(|mut path| {
+                                    // The portal does not change the name when the format is chosen: a name still with the
+                                    // suggested format's extension (or with none, or one of no format) takes the chosen
+                                    // format's; one typed with another format's extension is kept.
+                                    let extension = path.extension().and_then(|e| e.to_str()).map(str::to_string);
+                                    let is_of = |index: usize| extension.as_deref().is_some_and(|e| formats[index].1.iter().any(|x| x.eq_ignore_ascii_case(e)));
+                                    let known = (0..formats.len()).any(is_of);
+                                    if let Some((_, extensions)) = chosen {
+                                        if !known || (is_of(initial) && !formats[initial].1.iter().any(|x| x == &extensions[0])) {
+                                            path.set_extension(&extensions[0]);
+                                        }
+                                    }
+                                    path
+                                }))
+                        }
                         Err(ashpd::Error::Response(_)) => Ok(None),
                         Err(e) => Err(e.into()),
                     };

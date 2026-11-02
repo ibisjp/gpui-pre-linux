@@ -29,6 +29,14 @@ use wayland_client::protocol::wl_data_offer::WlDataOffer;
 use wayland_client::protocol::wl_pointer::AxisSource;
 use wayland_client::protocol::{
     wl_data_device, wl_data_device_manager, wl_data_offer, wl_data_source, wl_output, wl_region,
+    wl_touch,
+};
+// Modified by ibis inc.: tablet (pen) and touch input.
+use super::pen_input::{self, PenButton, TouchTracker};
+use wayland_protocols::wp::tablet::zv2::client::{
+    zwp_tablet_manager_v2, zwp_tablet_pad_dial_v2, zwp_tablet_pad_group_v2, zwp_tablet_pad_ring_v2,
+    zwp_tablet_pad_strip_v2, zwp_tablet_pad_v2, zwp_tablet_seat_v2, zwp_tablet_tool_v2,
+    zwp_tablet_v2,
 };
 use wayland_client::{
     Connection, Dispatch, Proxy, QueueHandle, delegate_noop,
@@ -224,6 +232,7 @@ pub struct Globals {
     pub blur_manager: Option<org_kde_kwin_blur_manager::OrgKdeKwinBlurManager>,
     pub text_input_manager: Option<zwp_text_input_manager_v3::ZwpTextInputManagerV3>,
     pub gesture_manager: Option<zwp_pointer_gestures_v1::ZwpPointerGesturesV1>,
+    pub tablet_manager: Option<zwp_tablet_manager_v2::ZwpTabletManagerV2>,
     pub dialog: Option<xdg_wm_dialog_v1::XdgWmDialogV1>,
     pub system_bell: Option<xdg_system_bell_v1::XdgSystemBellV1>,
     pub executor: ForegroundExecutor,
@@ -270,6 +279,7 @@ impl Globals {
             blur_manager: globals.bind(&qh, 1..=1, ()).ok(),
             text_input_manager: globals.bind(&qh, 1..=1, ()).ok(),
             gesture_manager: globals.bind(&qh, 1..=3, ()).ok(),
+            tablet_manager: globals.bind(&qh, 1..=1, ()).ok(),
             dialog: globals.bind(&qh, dialog_v..=dialog_v, ()).ok(),
             system_bell: globals.bind(&qh, 1..=1, ()).ok(),
             executor,
@@ -321,6 +331,15 @@ pub(crate) struct WaylandClientState {
     wl_pointer: Option<wl_pointer::WlPointer>,
     pinch_gesture: Option<zwp_pointer_gesture_pinch_v1::ZwpPointerGesturePinchV1>,
     pinch_scale: f32,
+    // Modified by ibis inc.: pen (tablet) and touch input turned into mouse input.
+    wl_touch: Option<wl_touch::WlTouch>,
+    tablet_seat: Option<zwp_tablet_seat_v2::ZwpTabletSeatV2>,
+    touch: TouchTracker,
+    pen_in_proximity: bool,
+    pen_pending_window: Option<WaylandWindowStatePtr>,
+    synth_window: Option<WaylandWindowStatePtr>,
+    synth_location: Point<Pixels>,
+    synth_button: Option<MouseButton>,
     wl_keyboard: Option<wl_keyboard::WlKeyboard>,
     cursor_shape_device: Option<wp_cursor_shape_device_v1::WpCursorShapeDeviceV1>,
     data_device: Option<wl_data_device::WlDataDevice>,
@@ -994,6 +1013,14 @@ impl WaylandClient {
             wl_keyboard: None,
             pinch_gesture: None,
             pinch_scale: 1.0,
+            wl_touch: None,
+            tablet_seat: None,
+            touch: TouchTracker::default(),
+            pen_in_proximity: false,
+            pen_pending_window: None,
+            synth_window: None,
+            synth_location: Point::default(),
+            synth_button: None,
             cursor_shape_device: None,
             data_device,
             primary_selection,
@@ -1827,6 +1854,26 @@ impl Dispatch<wl_seat::WlSeat, ()> for WaylandClientStatePtr {
 
                 state.wl_pointer = Some(pointer);
             }
+            // Modified by ibis inc.: touch screens.
+            if capabilities.contains(wl_seat::Capability::Touch) {
+                let touch = seat.get_touch(qh, ());
+                if let Some(old) = state.wl_touch.replace(touch) {
+                    old.release();
+                }
+            } else if let Some(old) = state.wl_touch.take() {
+                old.release();
+                state.touch.clear();
+            }
+            // Modified by ibis inc.: graphics tablets (pens). Once a client uses the
+            // tablet protocol the compositor sends the pen through it instead of
+            // converting it to wl_pointer events.
+            if state.tablet_seat.is_none() {
+                state.tablet_seat = state
+                    .globals
+                    .tablet_manager
+                    .as_ref()
+                    .map(|manager| manager.get_tablet_seat(seat, qh, ()));
+            }
         }
     }
 }
@@ -2250,6 +2297,11 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                 if state.mouse_focused_window.is_none() {
                     return;
                 }
+                // Modified by ibis inc.: a pen or finger is being handled through its own
+                // protocol; ignore a duplicate pointer event the compositor may also send.
+                if state.pen_in_proximity || state.touch.is_active() {
+                    return;
+                }
                 state.mouse_location = Some(point(px(surface_x as f32), px(surface_y as f32)));
                 state.restore_cursor_after_hide();
 
@@ -2308,6 +2360,10 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                 }
                 let button = linux_button_to_gpui(button);
                 let Some(button) = button else { return };
+                // Modified by ibis inc.: see Motion above.
+                if state.pen_in_proximity || state.touch.is_active() {
+                    return;
+                }
                 if state.mouse_focused_window.is_none() {
                     return;
                 }
@@ -3219,5 +3275,357 @@ mod tests {
             text_input.cursor_rectangles.borrow().as_slice(),
             &[(10, 20, 1, 18)]
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Modified by ibis inc.: pen (zwp_tablet_v2) and touch (wl_touch) input.
+// Both are turned into the same mouse input GPUI already handles
+// (MouseMove / MouseDown / MouseUp / MouseExited). The pure mapping parts are in
+// pen_input.rs.
+// ---------------------------------------------------------------------------
+
+fn pen_button_to_gpui(button: PenButton) -> MouseButton {
+    match button {
+        PenButton::Left => MouseButton::Left,
+        PenButton::Right => MouseButton::Right,
+        PenButton::Middle => MouseButton::Middle,
+    }
+}
+
+impl WaylandClientStatePtr {
+    /// A pen came into proximity of, or a finger touched, `window`: start hovering there.
+    fn synth_enter(&self, window: WaylandWindowStatePtr, position: Point<Pixels>) {
+        let client = self.get_client();
+        let mut state = client.borrow_mut();
+        state.synth_window = Some(window.clone());
+        state.synth_location = position;
+        state.synth_button = None;
+        state.restore_cursor_after_hide();
+        let modifiers = state.modifiers;
+        drop(state);
+        window.set_hovered(true);
+        window.handle_input(PlatformInput::MouseMove(MouseMoveEvent {
+            position,
+            pressed_button: None,
+            modifiers,
+        }));
+    }
+
+    fn synth_move(&self, position: Point<Pixels>) {
+        let client = self.get_client();
+        let mut state = client.borrow_mut();
+        state.synth_location = position;
+        let Some(window) = state.synth_window.clone() else {
+            return;
+        };
+        let input = PlatformInput::MouseMove(MouseMoveEvent {
+            position,
+            pressed_button: state.synth_button,
+            modifiers: state.modifiers,
+        });
+        drop(state);
+        window.handle_input(input);
+    }
+
+    fn synth_press(&self, button: MouseButton, serial: Option<u32>) {
+        let client = self.get_client();
+        let mut state = client.borrow_mut();
+        let Some(window) = state.synth_window.clone() else {
+            return;
+        };
+        // Only one button at a time, like the mouse state GPUI keeps.
+        if state.synth_button.is_some() {
+            return;
+        }
+        if let Some(serial) = serial {
+            state.serial_tracker.update(SerialKind::MousePress, serial);
+        }
+        if state.keyboard_focused_window.is_some() {
+            if state.composing && state.text_input.is_some() {
+                drop(state);
+                self.disable_ime();
+                self.enable_ime();
+                window.handle_ime(ImeInput::UnmarkText);
+                state = client.borrow_mut();
+            } else if let (Some(text), Some(compose)) =
+                (state.pre_edit_text.take(), state.compose_state.as_mut())
+            {
+                compose.reset();
+                drop(state);
+                window.handle_ime(ImeInput::InsertText(text));
+                state = client.borrow_mut();
+            }
+        }
+        let position = state.synth_location;
+        if state.click.last_click.elapsed() < DOUBLE_CLICK_INTERVAL
+            && state.click.last_mouse_button == Some(button)
+            && is_within_click_distance(state.click.last_location, position)
+        {
+            state.click.current_count += 1;
+        } else {
+            state.click.current_count = 1;
+        }
+        state.click.last_click = Instant::now();
+        state.click.last_mouse_button = Some(button);
+        state.click.last_location = position;
+        state.synth_button = Some(button);
+        let input = PlatformInput::MouseDown(MouseDownEvent {
+            button,
+            position,
+            modifiers: state.modifiers,
+            click_count: state.click.current_count,
+            first_mouse: state.enter_token.take().is_some(),
+        });
+        drop(state);
+        window.handle_input(input);
+    }
+
+    fn synth_release(&self, button: MouseButton) {
+        let client = self.get_client();
+        let mut state = client.borrow_mut();
+        if state.synth_button != Some(button) {
+            return;
+        }
+        let Some(window) = state.synth_window.clone() else {
+            return;
+        };
+        state.synth_button = None;
+        let input = PlatformInput::MouseUp(MouseUpEvent {
+            button,
+            position: state.synth_location,
+            modifiers: state.modifiers,
+            click_count: state.click.current_count,
+        });
+        drop(state);
+        window.handle_input(input);
+    }
+
+    /// The pen left proximity or the finger was lifted.
+    fn synth_leave(&self) {
+        let client = self.get_client();
+        let mut state = client.borrow_mut();
+        let Some(window) = state.synth_window.take() else {
+            return;
+        };
+        let input = PlatformInput::MouseExited(MouseExitEvent {
+            position: state.synth_location,
+            pressed_button: state.synth_button.take(),
+            modifiers: state.modifiers,
+        });
+        drop(state);
+        window.handle_input(input);
+        window.set_hovered(false);
+    }
+}
+
+delegate_noop!(WaylandClientStatePtr: ignore zwp_tablet_manager_v2::ZwpTabletManagerV2);
+delegate_noop!(WaylandClientStatePtr: ignore zwp_tablet_v2::ZwpTabletV2);
+delegate_noop!(WaylandClientStatePtr: ignore zwp_tablet_pad_ring_v2::ZwpTabletPadRingV2);
+delegate_noop!(WaylandClientStatePtr: ignore zwp_tablet_pad_strip_v2::ZwpTabletPadStripV2);
+delegate_noop!(WaylandClientStatePtr: ignore zwp_tablet_pad_dial_v2::ZwpTabletPadDialV2);
+
+impl Dispatch<zwp_tablet_seat_v2::ZwpTabletSeatV2, ()> for WaylandClientStatePtr {
+    fn event(
+        _: &mut Self,
+        _: &zwp_tablet_seat_v2::ZwpTabletSeatV2,
+        _: zwp_tablet_seat_v2::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        // Tablets, tools and pads are announced here; the tool object delivers the events.
+    }
+
+    event_created_child!(WaylandClientStatePtr, zwp_tablet_seat_v2::ZwpTabletSeatV2, [
+        zwp_tablet_seat_v2::EVT_TABLET_ADDED_OPCODE => (zwp_tablet_v2::ZwpTabletV2, ()),
+        zwp_tablet_seat_v2::EVT_TOOL_ADDED_OPCODE => (zwp_tablet_tool_v2::ZwpTabletToolV2, ()),
+        zwp_tablet_seat_v2::EVT_PAD_ADDED_OPCODE => (zwp_tablet_pad_v2::ZwpTabletPadV2, ()),
+    ]);
+}
+
+// The pad (buttons / rings / strips on the tablet itself) is not used, but its child
+// objects must still be accepted.
+impl Dispatch<zwp_tablet_pad_v2::ZwpTabletPadV2, ()> for WaylandClientStatePtr {
+    fn event(
+        _: &mut Self,
+        _: &zwp_tablet_pad_v2::ZwpTabletPadV2,
+        _: zwp_tablet_pad_v2::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+
+    event_created_child!(WaylandClientStatePtr, zwp_tablet_pad_v2::ZwpTabletPadV2, [
+        zwp_tablet_pad_v2::EVT_GROUP_OPCODE => (zwp_tablet_pad_group_v2::ZwpTabletPadGroupV2, ()),
+    ]);
+}
+
+impl Dispatch<zwp_tablet_pad_group_v2::ZwpTabletPadGroupV2, ()> for WaylandClientStatePtr {
+    fn event(
+        _: &mut Self,
+        _: &zwp_tablet_pad_group_v2::ZwpTabletPadGroupV2,
+        _: zwp_tablet_pad_group_v2::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+
+    event_created_child!(WaylandClientStatePtr, zwp_tablet_pad_group_v2::ZwpTabletPadGroupV2, [
+        zwp_tablet_pad_group_v2::EVT_RING_OPCODE => (zwp_tablet_pad_ring_v2::ZwpTabletPadRingV2, ()),
+        zwp_tablet_pad_group_v2::EVT_STRIP_OPCODE => (zwp_tablet_pad_strip_v2::ZwpTabletPadStripV2, ()),
+        zwp_tablet_pad_group_v2::EVT_DIAL_OPCODE => (zwp_tablet_pad_dial_v2::ZwpTabletPadDialV2, ()),
+    ]);
+}
+
+impl Dispatch<zwp_tablet_tool_v2::ZwpTabletToolV2, ()> for WaylandClientStatePtr {
+    fn event(
+        this: &mut Self,
+        tool: &zwp_tablet_tool_v2::ZwpTabletToolV2,
+        event: zwp_tablet_tool_v2::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        use zwp_tablet_tool_v2::Event;
+        match event {
+            Event::ProximityIn { surface, .. } => {
+                // proximity_in is followed by a motion event with the position; hover
+                // starts there.
+                let client = this.get_client();
+                let mut state = client.borrow_mut();
+                let Some(window) = get_window(&mut state, &surface.id()) else {
+                    return;
+                };
+                state.pen_in_proximity = true;
+                state.pen_pending_window = Some(window);
+            }
+            Event::ProximityOut => {
+                // The compositor releases pressed buttons before this; be safe anyway.
+                let pressed = this.get_client().borrow().synth_button;
+                if let Some(button) = pressed {
+                    this.synth_release(button);
+                }
+                {
+                    let client = this.get_client();
+                    let mut state = client.borrow_mut();
+                    state.pen_in_proximity = false;
+                    state.pen_pending_window = None;
+                }
+                this.synth_leave();
+            }
+            Event::Motion { x, y } => {
+                let position = point(px(x as f32), px(y as f32));
+                let pending = this.get_client().borrow_mut().pen_pending_window.take();
+                if let Some(window) = pending {
+                    this.synth_enter(window, position);
+                } else if this.get_client().borrow().pen_in_proximity {
+                    this.synth_move(position);
+                }
+            }
+            Event::Down { serial } => {
+                if this.get_client().borrow().pen_in_proximity {
+                    this.synth_press(pen_button_to_gpui(pen_input::tip_button()), Some(serial));
+                }
+            }
+            Event::Up => {
+                this.synth_release(pen_button_to_gpui(pen_input::tip_button()));
+            }
+            Event::Button {
+                serial,
+                button,
+                state: WEnum::Value(button_state),
+            } => {
+                let Some(button) = pen_input::stylus_button(button).map(pen_button_to_gpui) else {
+                    return;
+                };
+                if !this.get_client().borrow().pen_in_proximity {
+                    return;
+                }
+                match button_state {
+                    zwp_tablet_tool_v2::ButtonState::Pressed => {
+                        this.synth_press(button, Some(serial))
+                    }
+                    zwp_tablet_tool_v2::ButtonState::Released => this.synth_release(button),
+                    _ => {}
+                }
+            }
+            Event::Removed => {
+                // The tool is gone; make sure no hover / press stays.
+                {
+                    let client = this.get_client();
+                    let mut state = client.borrow_mut();
+                    state.pen_in_proximity = false;
+                    state.pen_pending_window = None;
+                }
+                this.synth_leave();
+                tool.destroy();
+            }
+            // Pressure, tilt, distance, rotation, slider and wheel have no equivalent in
+            // GPUI mouse events. Tip contact (down / up) is what decides a press.
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<wl_touch::WlTouch, ()> for WaylandClientStatePtr {
+    fn event(
+        this: &mut Self,
+        _: &wl_touch::WlTouch,
+        event: wl_touch::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            wl_touch::Event::Down {
+                serial,
+                surface,
+                id,
+                x,
+                y,
+                ..
+            } => {
+                let client = this.get_client();
+                let mut state = client.borrow_mut();
+                let Some(window) = get_window(&mut state, &surface.id()) else {
+                    return;
+                };
+                if !state.touch.down(id) {
+                    return;
+                }
+                drop(state);
+                this.synth_enter(window, point(px(x as f32), px(y as f32)));
+                this.synth_press(MouseButton::Left, Some(serial));
+            }
+            wl_touch::Event::Motion { id, x, y, .. } => {
+                if this.get_client().borrow().touch.is_primary(id) {
+                    this.synth_move(point(px(x as f32), px(y as f32)));
+                }
+            }
+            wl_touch::Event::Up { id, .. } => {
+                if this.get_client().borrow_mut().touch.up(id) {
+                    this.synth_release(MouseButton::Left);
+                    this.synth_leave();
+                }
+            }
+            wl_touch::Event::Cancel => {
+                // The compositor took the touch over (e.g. a system gesture).
+                let was_active = {
+                    let client = this.get_client();
+                    let mut state = client.borrow_mut();
+                    let was_active = state.touch.is_active();
+                    state.touch.clear();
+                    was_active
+                };
+                if was_active {
+                    this.synth_release(MouseButton::Left);
+                    this.synth_leave();
+                }
+            }
+            _ => {}
+        }
     }
 }

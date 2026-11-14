@@ -335,6 +335,8 @@ pub(crate) struct WaylandClientState {
     wl_touch: Option<wl_touch::WlTouch>,
     tablet_seat: Option<zwp_tablet_seat_v2::ZwpTabletSeatV2>,
     touch: TouchTracker,
+    // Modified by ibis inc. (#209): two fingers are a pinch (gpui's shared tracker); the first finger's mouse input is cancelled.
+    touch_pinch: gpui::PinchTracker,
     pen_in_proximity: bool,
     pen_pending_window: Option<WaylandWindowStatePtr>,
     synth_window: Option<WaylandWindowStatePtr>,
@@ -1016,6 +1018,7 @@ impl WaylandClient {
             wl_touch: None,
             tablet_seat: None,
             touch: TouchTracker::default(),
+            touch_pinch: gpui::PinchTracker::default(),
             pen_in_proximity: false,
             pen_pending_window: None,
             synth_window: None,
@@ -1863,6 +1866,7 @@ impl Dispatch<wl_seat::WlSeat, ()> for WaylandClientStatePtr {
             } else if let Some(old) = state.wl_touch.take() {
                 old.release();
                 state.touch.clear();
+                state.touch_pinch.clear();
             }
             // Modified by ibis inc.: graphics tablets (pens). Once a client uses the
             // tablet protocol the compositor sends the pen through it instead of
@@ -3401,6 +3405,51 @@ impl WaylandClientStatePtr {
         window.handle_input(input);
     }
 
+    /// A touch session event for the window the synthesized mouse input goes to (ibis inc., #209).
+    fn synth_session(&self, phase: TouchPhase) {
+        let client = self.get_client();
+        let state = client.borrow();
+        let Some(window) = state.synth_window.clone() else {
+            return;
+        };
+        let input = PlatformInput::TouchSession(gpui::TouchSessionEvent {
+            phase,
+            position: state.synth_location,
+        });
+        drop(state);
+        window.handle_input(input);
+    }
+
+    /// The finger that was synthesized into a mouse press is taken back: nothing is released, the touch
+    /// session is cancelled so the application undoes what the press did (ibis inc., #209).
+    fn synth_cancel_press(&self) {
+        let client = self.get_client();
+        {
+            let mut state = client.borrow_mut();
+            if state.synth_button.take().is_none() {
+                return;
+            }
+        }
+        self.synth_session(TouchPhase::Cancelled);
+    }
+
+    fn synth_pinch(&self, center: Point<Pixels>, delta: f32, phase: TouchPhase) {
+        let client = self.get_client();
+        let mut state = client.borrow_mut();
+        let Some(window) = state.synth_window.clone() else {
+            return;
+        };
+        state.synth_location = center;
+        let input = PlatformInput::Pinch(gpui::PinchEvent {
+            position: center,
+            delta,
+            modifiers: state.modifiers,
+            phase,
+        });
+        drop(state);
+        window.handle_input(input);
+    }
+
     /// The pen left proximity or the finger was lifted.
     fn synth_leave(&self) {
         let client = self.get_client();
@@ -3579,6 +3628,8 @@ impl Dispatch<wl_touch::WlTouch, ()> for WaylandClientStatePtr {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
+        // Modified by ibis inc. (#209): every finger goes through gpui's PinchTracker. One finger is a mouse
+        // press as before (with a touch session around it); a second finger cancels it and starts a pinch.
         match event {
             wl_touch::Event::Down {
                 serial,
@@ -3588,40 +3639,99 @@ impl Dispatch<wl_touch::WlTouch, ()> for WaylandClientStatePtr {
                 y,
                 ..
             } => {
+                let position = point(px(x as f32), px(y as f32));
                 let client = this.get_client();
                 let mut state = client.borrow_mut();
                 let Some(window) = get_window(&mut state, &surface.id()) else {
                     return;
                 };
-                if !state.touch.down(id) {
-                    return;
+                let down = state.touch_pinch.down(i64::from(id), position);
+                match down {
+                    gpui::PinchDown::Single => {
+                        if !state.touch.down(id) {
+                            return;
+                        }
+                        drop(state);
+                        this.synth_enter(window, position);
+                        this.synth_session(TouchPhase::Started);
+                        this.synth_press(MouseButton::Left, Some(serial));
+                    }
+                    gpui::PinchDown::Begin { center, .. } => {
+                        state.touch.clear();
+                        drop(state);
+                        // The first finger's press is taken back; the window is where it was pressed.
+                        this.synth_cancel_press();
+                        this.synth_pinch(center, 0.0, TouchPhase::Started);
+                    }
+                    gpui::PinchDown::Ignored => {}
                 }
-                drop(state);
-                this.synth_enter(window, point(px(x as f32), px(y as f32)));
-                this.synth_press(MouseButton::Left, Some(serial));
             }
             wl_touch::Event::Motion { id, x, y, .. } => {
-                if this.get_client().borrow().touch.is_primary(id) {
-                    this.synth_move(point(px(x as f32), px(y as f32)));
+                let position = point(px(x as f32), px(y as f32));
+                let moved = this
+                    .get_client()
+                    .borrow_mut()
+                    .touch_pinch
+                    .moved(i64::from(id), position);
+                match moved {
+                    gpui::PinchMove::Single => {
+                        if this.get_client().borrow().touch.is_primary(id) {
+                            this.synth_move(position);
+                        }
+                    }
+                    gpui::PinchMove::Update { center, delta } => {
+                        this.synth_pinch(center, delta, TouchPhase::Moved);
+                    }
+                    gpui::PinchMove::Ignored => {}
                 }
             }
             wl_touch::Event::Up { id, .. } => {
-                if this.get_client().borrow_mut().touch.up(id) {
-                    this.synth_release(MouseButton::Left);
-                    this.synth_leave();
+                let up = {
+                    let client = this.get_client();
+                    let mut state = client.borrow_mut();
+                    let last = state.synth_location;
+                    state.touch_pinch.up(i64::from(id), last)
+                };
+                match up {
+                    gpui::PinchUp::Single => {
+                        if this.get_client().borrow_mut().touch.up(id) {
+                            this.synth_release(MouseButton::Left);
+                            this.synth_session(TouchPhase::Ended);
+                            this.synth_leave();
+                        }
+                    }
+                    gpui::PinchUp::End { center } => {
+                        this.synth_pinch(center, 0.0, TouchPhase::Ended);
+                        if !this.get_client().borrow().touch_pinch.has_fingers() {
+                            this.synth_leave();
+                        }
+                    }
+                    gpui::PinchUp::Ignored => {
+                        if !this.get_client().borrow().touch_pinch.has_fingers() {
+                            this.synth_leave();
+                        }
+                    }
                 }
             }
             wl_touch::Event::Cancel => {
                 // The compositor took the touch over (e.g. a system gesture).
-                let was_active = {
+                let (was_active, was_pinching, last) = {
                     let client = this.get_client();
                     let mut state = client.borrow_mut();
                     let was_active = state.touch.is_active();
+                    let was_pinching = state.touch_pinch.is_pinching();
                     state.touch.clear();
-                    was_active
+                    state.touch_pinch.clear();
+                    (was_active, was_pinching, state.synth_location)
                 };
+                if was_pinching {
+                    this.synth_pinch(last, 0.0, TouchPhase::Ended);
+                }
                 if was_active {
-                    this.synth_release(MouseButton::Left);
+                    // Taken back, not released: the application undoes the press.
+                    this.synth_cancel_press();
+                }
+                if was_active || was_pinching {
                     this.synth_leave();
                 }
             }

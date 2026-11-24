@@ -2522,6 +2522,7 @@ fn make_scroll_wheel_event(
     scroll_delta: Point<f32>,
     modifiers: Modifiers,
 ) -> gpui::ScrollWheelEvent {
+    touch_fingers: 0,
     // When shift is held down, vertical scrolling turns into horizontal scrolling.
     let delta = if modifiers.shift {
         Point {
@@ -2532,6 +2533,7 @@ fn make_scroll_wheel_event(
         scroll_delta
     };
     gpui::ScrollWheelEvent {
+        touch_fingers: 0,
         position,
         delta: ScrollDelta::Lines(delta),
         modifiers,
